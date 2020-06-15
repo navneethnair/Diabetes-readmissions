@@ -1,0 +1,443 @@
+---
+
+output:
+  html_document:
+    code_folding: show
+    highlight: haddock
+    theme: flatly
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.width = 7, fig.height = 4, results = FALSE)
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(dplyr, ggplot2, magrittr, gridExtra, reshape, rmarkdown, leaps, glmnet, bestglm, knitr, pROC, reshape2, car, varhandle, GGally) 
+library(glmnet)
+library(ggplot2)
+library(dplyr)
+library(bestglm)
+library(varhandle)
+```
+
+
+
+# Executive Summary
+
+
+## Background of the study
+
+Diabetes can lead to patients being continuously admitted and readmitted to hospitals. Readmissions are extremely costly to the system.Centers for Medicare and Medicaid Services announced in 2012 that they would no longer reimburse hospitals for services rendered if a patient was readmitted with complications within 30 days of discharge.
+
+The goal of this study is to identify important factors relating to the chance of a patient being readmitted within 30 days of discharge. We then make recommendations about effective interventions that could reduce the chance of being readmitted. 
+
+
+## Summary about the data
+
+The original data is from the Center for Clinical and Translational Research at Virginia Commonwealth University. It covers data on diabetes patients across 130 U.S. hospitals from 1999 to 2008. There are over 100,000 unique hospital admissions in this dataset, from ~70,000 unique patients. The data includes demographic elements, such as age, gender, and race, as well as clinical attributes such as tests conducted, emergency/inpatient visits, etc.
+
+For the sake of our analysis, we work with a cleaned or modified version of the original data set. The cleaned data set was obtained by removing columns that have large number of missing values or have low variability. Additionally, certain variables related to ICD9 diagnosis codes were regrouped or binned in the cleaned data set.
+
+
+## Methods used in the analysis
+
+We use three methods to build a model to predict the probability of a patient getting readmitted within 30 days.
+
+* Method 1: Simple logistic regression on a set of predictors
+* Method 2: Backward elimination to identify the best logistic regression model
+* Method 3: Lasso to get a logistic regression with low number of predictors and minimum cross validation error
+
+We plot ROC curves and compare the AUC of the three different models to select a final model
+
+Finally, we use bayes rule to come up with a probability threshold while making classification decisions of whether a patient would be readmitted within 30 days. We also calculate the weighted misclassification error of the model we select.
+
+
+## Main findings
+
+We find that the probability a person is readmitted within 30 days is a function of six variables
+
+* time_in_hospital: The patient’s length of stay in the hospital (in days)
+* num_medications : No. of distinct medications prescribed in the current encounter
+* number_emergency: Number of emergency visits by the patient in the year prior to the current encounter
+* number_inpatient: Number of inpatient visits by the patient in the year prior to the current encounter
+* number_diagnoses: Total no. of diagnosis entered for the patient
+* disch_disp_modified: Where the patient was discharged to after treatment  
+
+The logit or the log odds of the patient getting readmitted within 30 days is a linear increasing function of the six variables below:
+
+* time_in_hospital: logodds increases by 0.01 for every additional day the patient spends in the hospital
+* num_medications : logodds increases by 0.13 for every additional medication prescribed in the current encounter
+* number_emergency: logodds increases by 0.30 for every additional emergency visit in the prior year
+* number_inpatient: logodds increases by 0.69 for every additional inpatient visit in the prior year
+* number_diagnoses: logodds increases by 0.03 for every additional diagnoses entered for the patient
+* disch_disp_modified: log odds are the lowest when the patient is discharged to home and the highest when they are not discharged to either their home or to an SNF or to a home health service
+
+
+## Issues, concerns, limitations of the conclusions
+
+Limitations with data
+
+* Data is slightly dated with data coming from 1999 to 2008. It would be good to use a newer data set to see if the factors have changed in any way.
+* Data comes from select 130 hospitals in the US and might not be representative of every state and region of the US
+* Records are primarily for Caucasian and African American races with less than 5% entries for Asians and Hispanics
+* Several of the medicine related variables have been coded as factor variables of 4 levels. E.g., Down, steady, up etc. Some firther quantification or detail could increase scope for insights from these variables.
+
+Limitations with analysis
+
+* We have not considered the possibility of interaction terms
+* We have not considered the posibility of high order terms
+* We have restricted ourselves to logistic regression models and not explored the predictive power of methods like random forests
+
+
+
+# Detailed process of the analysis
+
+## Data Summary / EDA
+
+1. We start by reading in the readmission.csv file, which is a cleaned version of the diabetic.data.csv file.
+
+```{r}
+# read the data
+data_clean <- read.csv("readmission.csv")
+```
+
+
+```{r}
+# dimensions of the file
+dim <- dim(data_clean)
+dim
+levels(data_clean$insulin)
+```
+
+2. A basic dimension analysis of the readmission.csv file showed that there were `r dim[1]` variables and `r dim[2]` records in the file we were analyzing.
+
+3. The `r dim[2]` variables are a combination of factor and integer variables, as can be seen below
+
+```{r, results=TRUE}
+# structure of the data
+str(data_clean)
+```
+
+```{r}
+# structure of the data
+missing <- sum(is.na(data_clean))
+```
+
+4. We do a check to see if there are any missing values. `r missing` missing values were found in the data.
+
+5. Before we start building our model, we look at potential variable transformations that could make the model more useful. To identify opportunities for transformation, we looked at the correlation of the numeric variables with each other. See plots below.
+
+```{r, results=TRUE}
+data_clean_numeric <- data_clean[,c(5:12)] # selecting the numeric variables
+ggpairs(data_clean_numeric)
+```
+
+
+6. We explored six different avenues for variable transformation.
+
+* Transformation 1: We filtered out encounter id and patient nbr from the data set we will feed to the model since these are unique for each row in the data and will have no predictive power
+
+```{r}
+data_clean2<- data_clean %>%
+  select(-encounter_id, -patient_nbr)
+```
+
+* Transformation 2: We converted the readmitted variable to a two level factor variable. 1 indicates readmission within 30 days and zero indicates no readmission or readmission after more than 30 days.
+
+```{r}
+data_clean2 %<>%
+  mutate(readmitted = as.factor(if_else(readmitted %in% c("<30"),1,0)))
+```
+
+* Transformation 3: We looked at the skewness of the numeric variables in the data set. Based on this, we transformed four variables. num_medications is right skewed. So we perform a log transformation of num_medications. 
+
+```{r}
+data_clean3<- data_clean2 %>%
+  mutate(num_medications = log(num_medications))
+```
+
+* Tranformation 4: We looked at the skewness of number_inpatient, number_outpatient and number_emergency. Since most of the records have these variables as either 0 or 1, we convert these variables into factor variables with two level. If they are greater than 0, then they are coded as 1. Else they are coded as zero.
+
+```{r}
+data_clean4<- data_clean3 %>%
+  mutate(number_outpatient = as.factor(if_else(number_outpatient > 0, 1, 0))) %>% 
+  mutate(number_inpatient = as.factor(if_else(number_inpatient > 0, 1, 0))) %>%
+  mutate(number_emergency = as.factor(if_else(number_emergency > 0, 1, 0)))
+```
+
+* Transformation 5: We found race to have several ? values and gender to have unknown/missing as a level. We decided to omit rows with these values.
+
+```{r}
+data_clean5<- data_clean4 %>%
+  filter(gender %in% c("Female","Male")) %>%
+  filter(race %in% c("Asian","AfricanAmerican","Hispanic", "Caucasian", "Other"))
+```
+
+* Transformation 6: We decided to do further binning of diag1_mod, diag2_mod and diag3_mod variables. The rationale for this was that these variables have 24 factor levels each. This makes the model cumbersome to run. Out intuition was to look for a way to reduce the number of levels in these variables. Upon doing further research online, we realized that ICD9 codes starting with 2 were related to diabetes while others were not. So we firther combined the diag mod variables into two level variables.
+
+```{r}
+data_clean6<- data_clean5 %>%
+  mutate(diag1_mod = combine_factor(diag1_mod,variable = c("250.6","250.8","276"))) %>%
+  mutate(diag2_mod = combine_factor(diag2_mod,variable = c("250","250.01","250.02","276"))) %>%
+  mutate(diag3_mod = combine_factor(diag3_mod,variable = c("250","250.02","250.06","272","276"))) %>%
+  droplevels()
+
+levels(data_clean6$diag1_mod) <-  c("Diabetes related","Not diabetes related")
+levels(data_clean6$diag2_mod) <-  c("Diabetes related","Not diabetes related")
+levels(data_clean6$diag3_mod) <-  c("Diabetes related","Not diabetes related")
+
+```
+
+
+```{r}
+dim <- dim(data_clean6)
+dim
+```
+
+7. The final data set that we used for model building included `r dim[1]` records and `r dim[2] ` variables.
+
+
+## Analyses
+
+Before we start building models, we first create a testing and training datset.
+
+```{r}
+set.seed(06071991)
+index.t <- sample(nrow(data_clean6), 70000)
+train_data <- data_clean6[index.t, ]
+test_data <- data_clean6[-index.t, ]
+```
+
+
+### Model Building
+
+**1) Starting with a simple model**
+
+We start by building a simple model based on some secondary internet research. The goal was to identify a few predictors that are correlated with diabetes management. We identified diabtesMed, change and insulin as three predictors that could be related to success in diabetes care based on our research.
+
+We then setup a  logistic regression model with readmitted as the output variable and diabetesMed, insulin and change as predictors. We used logistic regression because we were interested in modelling probability of a person getting readmitted within 30 days.
+
+```{r}
+fit.simple <- glm (readmitted ~ diabetesMed+change+insulin, family = binomial, data=train_data)
+```
+
+The Anova test below shows that the three identified factors were inded all significant at the 0.001 level.
+
+```{r, results=TRUE}
+Anova(fit.simple)
+```
+
+A summary taboe to the logistic regression model is given below.
+
+```{r, results=TRUE}
+summary(fit.simple)
+```
+
+
+**2) Backward elimination**
+
+We then decided to start with all the predictors and do a backward elimination to arrive at a logistic regression model where all predictors are significant at the 0.01 level. 
+
+As part of the process we removed the following variables from the model one by one in the given order - race, adm_typ_mod, diag2_mod, glyburide, gender, pioglitazone, glimepiride, diag3_mod, glipizide, max_glu_serum, num_lab_procedures, rosiglitazone, A1Cresult, number_outpatient
+
+```{r}
+fit1 <- glm(readmitted~., train_data, family = binomial)
+Anova(fit1)
+
+fit1.1 <- update(fit1, .~. -race)
+Anova(fit1.1)
+
+fit1.2 <- update(fit1.1, .~. -adm_typ_mod)
+Anova(fit1.2)
+
+fit1.3 <- update(fit1.2, .~. -diag2_mod)
+Anova(fit1.3)
+
+fit1.4 <- update(fit1.3, .~. -glyburide)
+Anova(fit1.4)
+
+fit1.5 <- update(fit1.4, .~. -gender)
+Anova(fit1.5)
+
+fit1.6 <- update(fit1.5, .~. -pioglitazone)
+Anova(fit1.6)
+
+fit1.7 <- update(fit1.6, .~. -glimepiride)
+Anova(fit1.7)
+
+fit1.8 <- update(fit1.7, .~. -diag3_mod)
+Anova(fit1.8)
+
+fit1.9 <- update(fit1.8, .~. -glipizide)
+Anova(fit1.9)
+
+fit1.10 <- update(fit1.9, .~. -max_glu_serum)
+Anova(fit1.10)
+
+fit1.11 <- update(fit1.10, .~. -num_lab_procedures)
+Anova(fit1.11)
+
+fit1.12 <- update(fit1.11, .~. -rosiglitazone)
+Anova(fit1.12)
+
+fit1.13 <- update(fit1.12, .~. -A1Cresult)
+Anova(fit1.13)
+
+fit1.BE <- update(fit1.13, .~. -number_outpatient)
+Anova(fit1.BE)
+```
+
+The final model from backward elimination is given below
+
+```{r, results=TRUE}
+summary(fit1.BE)
+```
+
+**3) Lasso logistic regression**
+
+In our third attempt at model building, we try to build a simple / parsimonious logistic regression model using LASSO. 
+
+The plot of the cross validation error for alpha = 1 and different lambda values is shown below
+
+```{r, echo=TRUE}
+set.seed(06071991)
+X <- model.matrix(readmitted~., train_data)[,-1]
+Y <- train_data$readmitted
+fit.cv <- cv.glmnet(X, Y, alpha=1, nfolds = 10, family="binomial")
+plot(fit.cv)
+```
+
+We choose lambda.1se to get a simple model with 6 predictors. The predictors selected by the model are:
+
+
+```{r, results=TRUE}
+coef.1se <- coef(fit.cv, s="lambda.1se")
+coef.1se <- coef.1se [which (coef.1se != 0),]
+rownames(as.matrix(coef.1se))
+```
+
+The summary of the LASSO logistic regression model is shown below
+
+```{r, results=TRUE}
+fit_Lasso_Logit <- glm(readmitted~time_in_hospital+num_medications+number_emergency+number_inpatient+number_diagnoses+disch_disp_modified, family=binomial, data=train_data)
+summary(fit_Lasso_Logit)
+```
+
+
+###Model selection
+
+We now have three models on our hands - fit.simple, fit.BE and fit.Lasso_Logit. To select the best model out of these three, we plot the ROC curves for the three models using the testing data.
+
+```{r, results=TRUE}
+
+fit.lasso.fitted.test <- predict(fit_Lasso_Logit, test_data, type="response")
+fit.backward.fitted.test <- predict(fit1.BE, test_data, type="response")
+fit.simple.fitted.test <- predict(fit.simple, test_data, type = "response")
+
+
+fit.lasso.test.roc <- roc(test_data$readmitted, fit.lasso.fitted.test)
+fit.backward.test.roc <- roc(test_data$readmitted, fit.backward.fitted.test)
+fit.simple.test.roc <- roc(test_data$readmitted,fit.simple.fitted.test)
+
+
+
+plot(1-fit.backward.test.roc$specificities, fit.backward.test.roc$sensitivities,
+     col="red", type="l", lwd=4,
+     xlab=paste(" AUC(Backward Elimination) =",
+                round(pROC::auc(fit.backward.test.roc),2),
+                " AUC(Lasso Logistic) =",
+                round(pROC::auc(fit.lasso.test.roc),2),
+                " AUC(Simple model) =",
+                round(pROC::auc(fit.simple.test.roc),2)),
+     ylab="Sensitivities")
+lines(1-fit.lasso.test.roc$specificities, fit.lasso.test.roc$sensitivities, col="green", lwd=3)
+lines(1-fit.simple.test.roc$specificities,fit.simple.test.roc$sensitivities,col="blue", lwd=3)
+legend("bottomright", legend=c("Backward elimination model", "Lasso Logistic model", "Simple 3 variable logistic regression"),
+       lty=c(1,1), lwd=c(2,2), col=c("red","green", "blue"))
+
+title("Comparison of three models using testing data")
+
+```
+
+We select the Lasso logistic regression model as the final model because it is a simple model (low number od predictors) and it's AUC is almost as high as the backward elimination model.
+
+
+
+### Classification rule and classification error
+
+**1) Bayes rule**
+
+* $a_{1,0}=L(Y=1, \hat Y=0)$, the loss (cost) of making an "1" to a "0" (false negative). I.e. the cost of misclassifying a potential readmit to non-readmit
+
+
+* $a_{0,1}=L(Y=0, \hat Y=1)$, the loss of making a "0" to an "1" (false positive) i.e. the cost of misclassifying a non-readmit to a redmit on
+
+* $a_{0, 0} = a_{1, 1}=0$ (correct classification)
+
+We believe that cost, $a_{1,0}$ is higher than $a_{0,1}$ because in that particular it would lose the opportunity to discuss and pass laws that could benefit the society greatly. 
+
+So, the loss function we are taking is 
+$a_{1,0}$ = $2a_{0,1}$
+
+We have the following optimal rule: 
+
+$$\begin{split}
+\hat Y=1 ~~~~ \text{if} ~~~~ &\quad \frac{P(Y=1 \vert X)}{P(Y=0\vert X)} > \frac{a_{0,1}}{a_{1,0}} \\
+& \Leftrightarrow P(Y=1 \vert X) > \frac{\frac{a_{0,1}}{a_{1,0}}}{1 + \frac{a_{0,1}}{a_{1,0}}}
+\end{split}
+$$
+
+Plugging in our values, the Bayes rule is thresholding over the 
+$$\hat P(Y=1 \vert x) > \frac{0.5}{(1+0.5)}=0.33$$
+
+or
+$$logit > \log(\frac{0.33}{0.67})= - 0.7081$$
+
+
+
+**2) Weighted misclassification error**
+
+```{r}
+fitfinal.pred.bayes <- as.factor(ifelse(fit_Lasso_Logit$fitted > .33, "1", "0"))
+MCE.bayes <- (2*sum(fitfinal.pred.bayes[train_data$readmitted == "1"] != "1")
++ sum(fitfinal.pred.bayes[train_data$readmitted == "0"] != "0"))/length(train_data$readmitted)
+MCE.bayes
+```
+
+
+Baseon the above loss function and probability threshold of 0.33, the weighted misclassification error is `r MCE.bayes`
+
+
+## Conclusion
+
+**1) Summary of results and final model**
+
+The summary of the final model is given below
+
+```{r, results=TRUE}
+summary(fit_Lasso_Logit)
+```
+
+Basically, the logit or the log odds of the patient getting readmitted within 30 days is a linear increasing function of the six variables below:
+
+* time_in_hospital: logodds increases by 0.01 for every additional day the patient spends in the hospital
+* num_medications : logodds increases by 0.13 for every additional medication prescribed in the current encounter
+* number_emergency: logodds increases by 0.30 for every additional emergency visit in the prior year
+* number_inpatient: logodds increases by 0.69 for every additional inpatient visit in the prior year
+* number_diagnoses: logodds increases by 0.03 for every additional diagnoses entered for the patient
+* disch_disp_modified: log odds are the lowest when the patient is discharged to home and the highest when they are not discharged to either their home or to an SNF or to a home health service
+
+
+**2) Final recommendations**
+
+Based on this analysis, we have a few recommendations for the hospital to minimize incidents of patients being readmitted within 30 days
+
+* Recommendation 1: Ensure that patients being discharged have a place to go to. Either their home or to ahome health service or SNF. When patients do not have a place to go to, there is a high chance of re-admittance
+* Recommendation 2: Monitor past emergency visits for each patient being admitted. Provide extra care and caution to patients with a high number of past emergency visits since they have a high chance of re-admittance
+* Recommendation 3: Monitor past inpatient visits for each patient being admitted. Provide extra care and caution to patients with a high number of past inpatient visits since they have a high chance of re-admittance
+* Recommendation 4: Be extra cautious with discharging patients who have already spent a significant number of days in the hospital. Do multiple checks to ensure they are ready to get discharged because they have a high chance of re-admittance
